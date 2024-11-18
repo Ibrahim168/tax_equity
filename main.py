@@ -1,131 +1,146 @@
 import os
+from langchain_openai import ChatOpenAI
 from crewai import Agent, Task, Crew, Process
-from crewai_tools import Tool, PDFSearchTool, SerperDevTool
-from langchain_experimental.tools import PythonAstREPLTool
-import pandas as pd
+from langchain_experimental.agents.agent_toolkits import create_csv_agent
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from typing import Any
+from pydantic import BaseModel
 
 # Set environment variables for API keys
-os.environ["OPENAI_API_KEY"] = "API_KEY"
-os.environ["SERPER_API_KEY"] = "00edf6bb7bb992e0bc5c8280ff96847c5f72ee40"
+os.environ["OPENAI_API_KEY"] = "OPENAI_API_KEY"
 
-class DatasetChatbot:
-    def __init__(self, dataset_path, pdf_doc_path):
-        """Initialize the chatbot with dataset and documentation paths"""
-        self.dataset_path = dataset_path
-        self.pdf_doc_path = pdf_doc_path
-        self.df = pd.read_csv(dataset_path)  # Assuming CSV format, adjust if needed
-        
-        # Initialize tools using CrewAI's Tool class
-        python_repl = PythonAstREPLTool()
-        self.python_tool = Tool(
-            name="Python REPL",
-            description="A Python REPL for executing Python code to analyze data",
-            func=python_repl.run
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+csv_file_path = "/Users/heem/Desktop/eo3.csv"
+pdf_file_path = "/Users/heem/Desktop/eo_master_file.pdf"
+
+class CSVAnalysisAgent(Agent):
+    csv_agent: Any = None
+
+    def __init__(self, csv_path):
+        super().__init__(
+            role="CSV Analysis Expert",
+            goal="Analyze and answer questions about CSV data",
+            backstory="I am an AI agent specialized in analyzing CSV files and providing insights from the data.",
+            allow_delegation=False
         )
         
-        # Use PDFSearchTool directly as it's already a CrewAI tool
-        self.pdf_tool = PDFSearchTool(pdf=pdf_doc_path)
+        # Set pandas display options to show all rows
+        import pandas as pd
+        pd.set_option('display.max_rows', None)
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
         
-        # Use SerperDevTool directly as it's already a CrewAI tool
-        self.search_tool = SerperDevTool()
+        self.csv_agent = create_csv_agent(
+            llm, 
+            csv_path, 
+            verbose=True, 
+            allow_dangerous_code=True
+        )
 
-    def create_agents(self):
-        """Create the specialized agents"""
+    def invoke(self, user_query):
+        return self.csv_agent.invoke(user_query)
+
+class PDFContextAgent(Agent):
+    vector_store: Any = None
+
+    def __init__(self, pdf_path):
+        super().__init__(
+            role="PDF Context Expert",
+            goal="Search and provide relevant context from PDF documentation",
+            backstory="I am an AI agent that helps find relevant information from PDF documentation to enhance data analysis.",
+            allow_delegation=False
+        )
         
-        # Data Analysis Agent
-        self.analyst = Agent(
-            role='Data Analyst',
-            goal='Analyze dataset and provide accurate insights',
-            backstory="""You are an expert data analyst skilled at analyzing datasets 
-                        and extracting meaningful insights. You have deep knowledge 
-                        of pandas and data analysis.""",
-            tools=[self.pdf_tool, self.python_tool],  # Using CrewAI tools
-            verbose=True,
+        # Load and process PDF
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+        
+        # Split documents into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        texts = text_splitter.split_documents(documents)
+        
+        # Create vector store
+        embeddings = OpenAIEmbeddings()
+        self.vector_store = FAISS.from_documents(texts, embeddings)
+
+    def invoke(self, query):
+        # Search for relevant context
+        docs = self.vector_store.similarity_search(query, k=2)
+        context = "\n".join([doc.page_content for doc in docs])
+        
+        # Use LLM to synthesize relevant information
+        prompt = f"Based on the following context from the documentation, what information is relevant to answer the query: '{query}'?\n\nContext: {context}"
+        response = llm.invoke(prompt)
+        return response.content
+
+class ManagerAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            role="Query Manager",
+            goal="Determine if a query needs additional context from documentation",
+            backstory="I am an AI agent that analyzes user queries and determines whether they need additional context from documentation to be answered properly.",
             allow_delegation=True
         )
 
-        # Response Agent 
-        self.communicator = Agent(
-            role='AI Communication Specialist',
-            goal='Provide clear, user-friendly responses about the dataset',
-            backstory="""You are an expert at communicating complex data insights 
-                        in simple, understandable terms. You excel at providing 
-                        context and explanations.""",
-            tools=[self.pdf_tool, self.search_tool],  # Using CrewAI tools
-            verbose=True,
-            allow_delegation=True
-        )
-
-    def create_tasks(self, user_question):
-        """Create tasks based on user question"""
+    def invoke(self, query):
+        prompt = f"""Analyze this query and determine if it likely needs additional context from documentation to be answered properly. 
+        Query: {query}
         
-        # Analysis Task
-        analysis_task = Task(
-            description=f"""
-                Analyze the dataset to answer: {user_question}
-                Use the Python tool to analyze the data when needed.
-                Use the PDF documentation tool to get additional context about columns.
-                Dataset is available as 'self.df' in the Python environment.
-                Provide detailed analysis results.
-            """,
-            agent=self.analyst,
-            expected_output="Detailed analysis results with supporting data",
-            human_input=False,
-            tool_input={"args": {"description": user_question}}
-        )
-
-        # Response Formulation Task
-        response_task = Task(
-            description=f"""
-                Using the analysis results and PDF documentation, create a clear,
-                user-friendly response to: {user_question}
-                Make sure to include relevant context from the documentation when needed.
-                The response should be informative yet easy to understand.
-            """,
-            agent=self.communicator,
-            expected_output="Clear, contextual response to the user's question",
-            human_input=False,
-            tool_input={"query": user_question}
-        )
-
-        return [analysis_task, response_task]
-
-    def answer_question(self, question):
-        """Process a user question and return an answer"""
-        
-        # Create crew
-        crew = Crew(
-            agents=[self.analyst, self.communicator],
-            tasks=self.create_tasks(question),
-            process=Process.sequential,
-            verbose=True,
-            memory=True  # Enable memory for context retention
-        )
-
-        # Get response
-        result = crew.kickoff()
-        return result
+        Respond with either 'YES' or 'NO' followed by a brief explanation.
+        """
+        response = llm.invoke(prompt)
+        return response.content.strip().upper().startswith('YES')
 
 def main():
-    # Initialize the chatbot
-    chatbot = DatasetChatbot(
-        dataset_path="/Users/heem/Desktop/eo3.csv",
-        pdf_doc_path="/Users/heem/Desktop/eo_master_file.pdf"
-    )
-    chatbot.create_agents()
-
-    # Interactive loop
-    print("Dataset Chatbot initialized. Type 'exit' to quit.")
+    print("Welcome to the Enhanced CSV Chatbot! Type 'quit' to exit.")
+    print("You can ask questions about your CSV file and related documentation.")
+    
+    # Add file existence checks
+    if not os.path.exists(csv_file_path):
+        raise FileNotFoundError(f"CSV file not found at: {csv_file_path}")
+    if not os.path.exists(pdf_file_path):
+        raise FileNotFoundError(f"PDF file not found at: {pdf_file_path}")
+    
+    csv_agent = CSVAnalysisAgent(csv_file_path)
+    pdf_agent = PDFContextAgent(pdf_file_path)
+    manager_agent = ManagerAgent()
+    
     while True:
-        question = input("\nWhat would you like to know about the dataset? ")
-        if question.lower() == 'exit':
+        user_query = input("\nEnter your question: ").strip()
+        
+        if user_query.lower() in ['quit', 'exit', 'bye']:
+            print("Thank you for using the Enhanced CSV Chatbot. Goodbye!")
             break
             
         try:
-            answer = chatbot.answer_question(question)
-            print("\nAnswer:", answer)
+            # First, let the manager decide if we need context
+            needs_context = manager_agent.invoke(user_query)
+            
+            if needs_context:
+                # Get relevant context from PDF
+                context = pdf_agent.invoke(user_query)
+                # Enhance the original query with context
+                enhanced_query = f"""Consider this additional context while answering the question:
+                {context}
+                
+                Now answer this question: {user_query}"""
+                response = csv_agent.invoke(enhanced_query)
+            else:
+                response = csv_agent.invoke(user_query)
+                
+            print("\nResponse:", response)
+            # Save the response to a CSV file
+
+            
         except Exception as e:
-            print(f"\nError processing question: {str(e)}")
+            print(f"\nError: {str(e)}")
+            print("Please try asking your question in a different way.")
 
 if __name__ == "__main__":
     main()
