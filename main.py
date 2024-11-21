@@ -5,8 +5,8 @@ from langchain_experimental.tools import PythonAstREPLTool
 import pandas as pd
 
 # Set environment variables for API keys
-os.environ["OPENAI_API_KEY"] = "API_KEY"
-os.environ["SERPER_API_KEY"] = "00edf6bb7bb992e0bc5c8280ff96847c5f72ee40"
+os.environ["OPENAI_API_KEY"] = "OPENAI_API_KEY"
+os.environ["SERPER_API_KEY"] = "SERPER_API_KEY"
 
 class DatasetChatbot:
     def __init__(self, dataset_path, pdf_doc_path):
